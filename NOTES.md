@@ -50,9 +50,6 @@ new scheme shows up.
 
 ### Open questions for next pass
 
-- Which SLH-DSA variant does libbitcoinpqc actually build, SHA2-128s
-  or SHAKE-128s? The docs say both in different places. Matters for
-  test vectors.
 - FIPS 206: revisit when the final standard lands.
 - MAX_SCRIPT_ELEMENT_SIZE (520 B) vs multi-kB signatures: witness
   element chunking, or a new limit under a new leaf version? Needs a
@@ -63,14 +60,42 @@ new scheme shows up.
 - Weight: my validation weight budget test (bitcoin-p2mr, FUTURE item
   8) is the measurement harness; port it to the new branch.
 
+## Hands-on with libbitcoinpqc, 2026-08-02
+
+Cloned and built it on my machine, pinned at commit 053e954. All 3 of
+its tests pass on macOS. What I learned:
+
+- The SLH-DSA variant question is settled: the build uses
+  SLH-DSA-SHA2-128s (PARAMS=sphincs-sha2-128s in CMake). Their PR #28
+  switched from SHAKE-128s and the README documents the migration;
+  the SHAKE naming that still shows up in the crates.io description
+  is stale.
+- Sizes confirmed with a real round trip against the built library
+  (keygen, sign, verify): ML-DSA-44 pk 1312 B / sig 2420 B,
+  SLH-DSA-SHA2-128s pk 32 B / sig 7856 B. secp256k1 is algorithm 0
+  in the same API, handy for like-for-like comparison. One full
+  SLH-DSA keygen+sign+verify cycle costs about 1.2 s of CPU on my
+  machine.
+- The API is a clean fit for a scheme-agnostic opcode: verify() takes
+  (algorithm enum, pubkey, message, signature) over arbitrary bytes.
+  The enum already numbers the algorithms (1 = ML-DSA-44, 2 =
+  SLH-DSA-SHA2-128s), which maps naturally onto a scheme byte.
+- No sighash or transaction logic anywhere in the library: it is pure
+  crypto primitives. Whatever sighash the opcode uses is entirely a
+  design decision on my side.
+- The SLH-DSA test alone takes ~10 of the suite's 11.5 seconds.
+  Hash-based signing/verification cost is real and will show up in
+  the stage 5 measurements.
+
+Scheme order for the prototype: SLH-DSA-SHA2-128s first, then
+ML-DSA-44. The 7856 B signature stresses the 520 B witness element
+question from day one, and the 32 B pubkey fits a leaf script the
+same way a Schnorr key does today.
+
 ## Next steps
 
-1. Clone and build libbitcoinpqc, read its API and QuBit integration
-   assumptions, settle the SHA2/SHAKE question.
-2. Create the `pq-opcode` branch off `p2mr-regtest`.
-3. Write the opcode design note (leaf version, scheme byte, encoding,
+1. Write the opcode design note (leaf version, scheme byte, encoding,
    520 B handling) before any consensus code.
-4. Prototype the verify path for one scheme end to end, then the
-   second.
-5. Measure witness sizes and validation cost; comparison table
+2. Prototype the verify path for SLH-DSA end to end, then ML-DSA.
+3. Measure witness sizes and validation cost; comparison table
    including paper numbers for FN-DSA, SHRINCS and SQIsign.
