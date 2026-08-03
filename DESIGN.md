@@ -2,15 +2,17 @@
 
 Design for the prototype on the `pq-opcode` branch. Every decision
 lists the alternative I rejected and why. Nothing here is final spec;
-it is the shape I am going to build and measure. Status: draft, not
-yet implemented.
+it is the shape I am building and measuring. The SLH-DSA path is
+implemented and tested; ML-DSA is not wired up yet.
 
 ## 1. Delivery: redefine an OP_SUCCESSx inside tapscript
 
 The opcode is a redefinition of OP_SUCCESS187 (0xbb) under leaf
 version 0xc0, the same leaves P2MR already executes with BIP 342
-rules. The prototype gates it behind a regtest-only script flag
-(SCRIPT_VERIFY_PQSIG), the same pattern SCRIPT_VERIFY_P2MR uses.
+rules. The prototype gates it behind a script flag
+(SCRIPT_VERIFY_PQSIG) that block validation applies on regtest only,
+the same pattern SCRIPT_VERIFY_P2MR uses. Mempool policy applies it
+everywhere, which the open questions below cover.
 
 This works because of an ordering fact I verified in Core's
 interpreter (ExecuteWitnessScript, interpreter.cpp): the OP_SUCCESSx
@@ -26,6 +28,16 @@ with the flag off, 0xbb stays OP_SUCCESS and the script is
 anyone-can-spend, so every rule the new semantics add is a
 restriction on something previously valid. That is the upgrade path
 BIP 342 reserved the OP_SUCCESSx range for.
+
+The flip side, and a reason a real BIP might prefer a different
+OP_SUCCESS number or the pqdata route: reusing 0xbb quietly changes
+what that byte means, so anything that treats the whole OP_SUCCESSx
+range uniformly has to special-case it. Core's own feature_taproot.py
+does exactly that, generating an OP_SUCCESS test per opcode value and
+asserting the unconditional-success behavior; with the flag active in
+regtest block validation, 0xbb no longer matches and the case has to
+be skipped. That is a signal worth carrying into the spec discussion,
+not just a test edit.
 
 Rejected: a new leaf version. It would buy the same freedom at the
 cost of specifying a whole execution context from scratch, and it
@@ -114,14 +126,19 @@ then the public key, then the signature.
 - Commitment not exactly 33 bytes, or scheme byte unknown: fail the
   script. Future schemes arrive through a new OP_SUCCESSx or a
   defined upgrade of this one, not through lax parsing.
-- Public key and signature must have exactly the sizes the scheme
-  defines (pubkey 1312 B and sig 2420/2421 B for ML-DSA-44, pubkey
-  32 B and sig 7856/7857 B for SLH-DSA-SHA2-128s), else fail. Strict
-  witness structure, same rationale as the P2MR rules: no third-party
-  malleability surface.
+- Empty signature: push false and consume no budget, with only the
+  commitment validated. The public key is deliberately not inspected
+  on this path: in a branch construction over two schemes, the stack
+  can carry a pubkey of the other scheme's size, and checking it here
+  would break exactly the IF/ELSE case this rule exists to keep
+  cheap. (Tapscript can hard-fail on empty pubkeys because all its
+  keys are 32 bytes; that logic does not transfer to multi-scheme.)
+- With a non-empty signature, public key and signature must have
+  exactly the sizes the scheme defines (pubkey 1312 B and sig
+  2420/2421 B for ML-DSA-44, pubkey 32 B and sig 7856/7857 B for
+  SLH-DSA-SHA2-128s), else fail. Strict witness structure, same
+  rationale as the P2MR rules: no third-party malleability surface.
 - H(pubkey) must equal the committed hash, else fail.
-- Empty signature: push false and consume no budget. Mirrors BIP 342,
-  keeps branch constructions (IF/ELSE over two schemes) cheap.
 - Any non-empty signature that does not verify: fail the script
   immediately, the BIP 342 rule that removes signature malleability
   as a relay vector.
@@ -141,9 +158,10 @@ deciding here; the prototype allows it and can measure it.
 
 ## 7. Validation weight
 
-Each passing OP_CHECKPQSIG subtracts a per-scheme constant from the
-BIP 342 budget (serialized witness size + 50). Placeholders until the
-stage 5 bench calibrates them:
+Each passing OP_CHECKPQSIG subtracts a constant from the BIP 342
+budget (serialized witness size + 50). The prototype starts with one
+shared placeholder; the bench splits it into per-scheme constants
+when the calibration numbers exist:
 
     cost_scheme = 50 * ceil(verify_time_scheme / verify_time_schnorr)
 
@@ -169,7 +187,7 @@ first number the stage 5 bench produces.
   larger).
 - The hybrid property from section 6 deserves a measured row of its
   own: one leaf requiring both a PQ and an EC signature, end to end.
-  Nobody has published that number.
+  I have not seen that number published anywhere.
 - Whether the scheme byte should encode security level variants
   (ML-DSA-65/87) or each variant gets its own id. Prototype: one id
   per exact parameter set, nothing implicit.
@@ -181,6 +199,15 @@ first number the stage 5 bench produces.
   bump the version.
 - Policy/standardness for relay of PQ spends: prototype runs with
   -acceptnonstdtxn=1 like the P2MR work did; a real deployment needs
-  its own standardness rules.
+  its own standardness rules. Note the asymmetry the flag placement
+  creates: mempool policy applies the opcode on every network, while
+  block validation applies it only on regtest, so on mainnet a 0xbb
+  leaf stops being rejected by DISCOURAGE_OP_SUCCESS and executes
+  instead. That direction is safe (mainnet consensus still treats
+  0xbb as OP_SUCCESS, so nothing the mempool accepts is invalid), and
+  real PQ spends stay non-standard anyway because the 80-byte
+  tapscript stack item limit rejects a multi-kB signature. Narrowing
+  the flag to regtest in the mempool would be worse: regtest would
+  then accept into the mempool what regtest blocks reject.
 - If the 2702 witness-style design lands, the encoding here migrates
   to that area; sizes in raw bytes carry over unchanged.
