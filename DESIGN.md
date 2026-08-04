@@ -2,8 +2,8 @@
 
 Design for the prototype on the `pq-opcode` branch. Every decision
 lists the alternative I rejected and why. Nothing here is final spec;
-it is the shape I am building and measuring. The SLH-DSA path is
-implemented and tested; ML-DSA is not wired up yet.
+it is the shape I am building and measuring. Both schemes are
+implemented and tested.
 
 ## 1. Delivery: redefine an OP_SUCCESSx inside tapscript
 
@@ -190,7 +190,11 @@ first number the stage 5 bench produces.
   I have not seen that number published anywhere.
 - Whether the scheme byte should encode security level variants
   (ML-DSA-65/87) or each variant gets its own id. Prototype: one id
-  per exact parameter set, nothing implicit.
+  per exact parameter set, nothing implicit. Wiring the second scheme
+  up showed the byte does more than select a verifier: since each
+  scheme has fixed object sizes, it also fixes what the witness may
+  carry, so a signature from the wrong scheme fails on size rather
+  than reaching verification at all.
 - key_version: the sighash reuses key_version 0, the value BIP 342
   assigns to BIP 340 keys, even though the field exists precisely for
   new key types. I think it is safe here (signature sizes are

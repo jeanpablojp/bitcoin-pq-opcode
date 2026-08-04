@@ -158,7 +158,7 @@ the same method I used on the P2MR stages: the commitment size check,
 the scheme check, the pubkey size check, the explicit-0x00 sighash
 rejection, the empty-signature short circuit, the flag gate in the
 scan and the element-limit scoping all get caught. Removing the
-budget subtraction did not, because one 7857-byte signature funds far
+budget subtraction did not, because one 7856-byte signature funds far
 more budget than a single check spends. A leaf that repeats the check
 over the same signature (OP_2DUP, commitment, OP_CHECKPQSIG,
 OP_VERIFY) funds no extra budget, so eight repetitions pass and nine
@@ -195,10 +195,11 @@ A few decisions and warts worth recording:
   alone: none of those paths see tapscript leaves anyway, since they
   check scriptPubKey and scriptSig while the leaf lives in the
   witness.
-- The vendored sign.c drags randombytes into the consensus library as
-  dead code (verification never calls it). A real PR would split the
-  sign path out of the consensus target; for the prototype it stays,
-  recorded here so it is a known wart and not an accident.
+- The signing half of the vendored code is compiled into the
+  consensus library even though verification is all consensus ever
+  calls. A real PR would split it out of that target; for the
+  prototype it stays, recorded here so it is a known wart and not an
+  accident.
 - SCRIPT_VERIFY_PQSIG sits in MANDATORY_SCRIPT_VERIFY_FLAGS, which
   mempool policy applies on every network, while GetBlockScriptFlags
   adds it only on regtest. So on mainnet a tapscript leaf containing
@@ -227,12 +228,113 @@ A few decisions and warts worth recording:
   would break IF/ELSE constructions over two schemes. The design note
   spells this out and a test pins it.
 
+## Stage 3, 2026-08-04: ML-DSA-44 on scheme byte 1
+
+Both schemes now verify under the same opcode. The scheme-agnostic
+design survived contact with a second implementation, but not for
+free:
+
+- The two reference implementations disagree about symbol naming.
+  Dilithium's sign.h macro-renames crypto_sign_* onto
+  pqcrystals_dilithium2_ref_*, while SPHINCS+ keeps the plain names.
+  Including both headers in one translation unit would let the
+  Dilithium macros rewrite calls meant for SPHINCS+, silently. Each
+  scheme now sits behind its own file (slh_dsa.cpp, ml_dsa.cpp) with
+  a plain C++ interface, and pqc_verify.cpp dispatches without
+  including either crypto header. I checked the object files rather
+  than trusting the build: ml_dsa.cpp.o references only
+  pqcrystals_dilithium2_ref_*, slh_dsa.cpp.o only crypto_sign_*.
+- Both trees ship a randombytes.c and both define randombytes(), so
+  vendoring either would eventually collide. Neither is vendored now.
+  randombytes.cpp provides one definition instead, seeded through
+  SeedKeypair and aborting if nothing was installed. Consensus never
+  reaches it: verification draws no randomness. That guard is for
+  vendored code drawing randomness nobody arranged for, not for
+  ordinary misuse, so SeedKeypair rejects an empty seed and Sign
+  returns false when no entropy is installed. Both used to abort the
+  process, which is not what a bad argument deserves.
+
+  Where each scheme actually needs it is worth writing down, because
+  the headers mislead on this. Dilithium draws
+  in key generation, which has no seeded entry point upstream, unlike
+  SPHINCS+ which takes a seed directly. Both also draw while signing:
+  SPHINCS+ randomizes its message digest, and this Dilithium copy
+  ships config.h with DILITHIUM_RANDOMIZED_SIGNING defined, so the
+  branch that compiles is not the deterministic one the #ifdef shows
+  first. Neither scheme signs deterministically on its own; both are
+  reproducible from a reinstalled seed, and a test pins that.
+- The size checks turned out to double as scheme separation. An
+  SLH-DSA key and signature offered against a leaf committing to
+  ML-DSA fails on size before anything else, and a leaf committing to
+  the right key under the wrong scheme byte fails on the commitment.
+  Both are tested.
+
+Tests: script_pqsig_ml_dsa covers a valid ML-DSA spend, a bit-flipped
+signature, the two cross-scheme cases above, and one leaf that
+requires both schemes with a key each. The stage 2 case asserting an
+ML-DSA leaf was unspendable is gone, replaced by that valid spend.
+Reproducibility is asserted rather than assumed: the same seed gives
+the same key pair, and two signatures over the same message match
+when the seed is reinstalled between them, which is the property
+future vectors would rely on.
+
+Mutation testing on the dispatch caught swapping which backend a
+scheme reaches and swapping the two schemes' declared sizes. Dropping
+the size check inside Verify() survived, and the reason is structural:
+the opcode enforces exact sizes before calling, so nothing reached the
+wrapper's own guard. That guard is the wrapper's contract rather than
+dead weight, since it is what makes the function safe to call from
+anywhere else, so it now has a test of its own (pqsig_verify_sizes)
+that exercises Verify directly with every wrong size, the other
+scheme's sizes, and unknown scheme bytes.
+
+The entropy hook needed a test of its own for the same kind of
+reason. Removing the counter increment from randombytes.cpp, which
+makes it hand back the same block over and over, changed nothing any
+test could see: every caller today asks for at most one block. A
+vector generator asking for more would have got correlated keys and
+no warning. pqsig_entropy_stream now checks the stream directly, that
+a long draw has distinct blocks, that successive draws continue
+rather than restart, that reinstalling the seed rewinds, and that a
+different seed gives a different stream.
+
+Mutating the per-scheme backends is caught as well: a message length
+of 31 instead of 32, in either direction, and discarding the verify
+return value.
+
+Both schemes also run clean under AddressSanitizer and
+UndefinedBehaviorSanitizer, across key generation, signing,
+verification, the rejection paths, and 600 malformed
+correctly-sized signatures fed to verification, which is where the
+vendored parsers do their work. None were accepted.
+
+Everything above only proves the code agrees with itself: the tests
+sign and verify with the same implementation, so a wrong parameter
+set or a botched call convention would pass unnoticed. No NIST
+known-answer vectors ship with either tree, only the generators. What
+I could do instead was cross-validate against a separately built
+libbitcoinpqc: signatures produced by the vendored code here are
+accepted by its bitcoin_pqc_verify for both schemes. That pins the
+parameter sets, the encodings and the ML-DSA context argument, which
+the two implementations pass differently in form (a zero-length
+buffer against a null pointer) but identically in effect. Real
+conformance still wants FIPS 204/205 vectors, and a companion BIP
+would need them.
+
+Full suite: 804 unit test cases green, feature_p2mr.py green,
+feature_taproot.py green, and the kernel target still links with the
+crypto dependency the entropy hook adds.
+
+Two notes for anyone pruning the vendored trees. dilithium/api.h is
+not reachable from anything we compile, so it is not vendored.
+sphincsplus/sha2_offsets.h looks equally unused by name, but the
+parameter header pulls it in through a relative path, so it stays;
+grepping for the file name alone will tell you the opposite.
+
 ## Next steps
 
-1. Stage 3: wire up ML-DSA-44 as scheme byte 1 and exercise the
-   scheme dispatch with cross-scheme negatives.
-2. Stage 4: feature_pqsig.py, spending through the PQ leaf in a real
+1. Stage 4: feature_pqsig.py, spending through the PQ leaf in a real
    block and rejecting a tampered one via submitblock.
-3. Stage 5: calibrate the budget constant from measured verify time;
+2. Stage 5: calibrate the budget constant from measured verify time;
    the comparison table including paper numbers for FN-DSA, SHRINCS
    and SQIsign.
