@@ -331,10 +331,98 @@ sphincsplus/sha2_offsets.h looks equally unused by name, but the
 parameter header pulls it in through a relative path, so it stays;
 grepping for the file name alone will tell you the opposite.
 
+## Stage 4, 2026-08-05: spending through real blocks
+
+feature_pqsig.py spends a PQ leaf under both schemes through a block
+built here and handed to submitblock, and watches the whole block go
+away when the signature is tampered with or the public key misses the
+commitment. That is consensus deciding, which no interpreter test
+reaches. Two constructions only a block can settle also pass: a leaf
+requiring an SLH-DSA and a Schnorr signature over the same sighash,
+and a leaf requiring both PQ schemes with a key each.
+
+Python cannot produce a post-quantum signature, so this needed a
+decision about how much of the test the node would do. The valuable
+part of feature_p2mr.py was that Python built its own sighashes: an
+independent reading of BIP 341/342 sitting across from the C++ one.
+That still holds here. Python builds the sighash, the witness and the
+block; two hidden regtest RPCs (pqpubkey, pqsignhash) supply only the
+primitive Python has no way to compute. They keep nothing: the seed
+arrives with each call, as the P2MR RPCs do.
+
+The policy reasoning from stage 2 turned out right by a more precise
+route than I described. I had expected the mempool to reject these on
+script verification; it rejects them as bad-witness-nonstandard, so
+the spend never reaches verification at all. The 80-byte standard
+stack item limit turns it away on witness shape, and the same
+transaction then goes into a block without complaint. The test asserts
+both halves.
+
+Mutation testing on the opcode, this time asking whether the
+functional test would notice: discarding the signature result is
+caught, and so is dropping the commitment check. The second one needs
+the right witness to catch it. A public key with a flipped byte
+proves nothing, because the signature check rejects that witness
+whether or not the commitment was consulted. What isolates the
+commitment is a signature that verifies perfectly, under a key the
+spender chose, against a leaf committing to somebody else's: the
+theft case, where the commitment is the only thing between an
+attacker and another person's output. Both schemes have that test.
+
+The RPCs are documented as keeping nothing, and the entropy state
+made that untrue. Key generation installs the seed in a global that
+outlives the call, so a caller's seed sat in process memory until the
+next one arrived. ClearDeterministicEntropy wipes it from a
+destructor, which covers the error paths too.
+
+Wiring that global to an RPC also broke an assumption I had written
+into it. The comment said nothing touching the entropy state runs on
+more than one thread, which held while only tests reached it and
+stopped holding the moment a handler did: the RPC server answers from
+a thread pool. Four signatures fired at once came back in the time
+one takes, so the overlap is real, and the sequence that has to be
+atomic is install, generate, rewind, sign, wipe. Locking each access
+would not do: another thread reinstalling between the install and the
+draw changes the result, and one wiping there trips the guard and
+takes the node down. EntropyLock holds a mutex across the whole
+sequence, after which six concurrent signatures take 7.14 s against
+7.19 s for the same six run one after another.
+
+No wrong signature ever came out of it in testing, since the window
+between installing entropy and consuming it is microseconds wide, so
+timing was never going to settle whether the code was correct.
+ThreadSanitizer does settle it: four threads through the sequence
+report data races on g_seed without the lock and nothing with it,
+and g_seed is the only location it names, so the diagnosis missed
+nothing.
+
+Verification deserved the same question, and more urgently, since
+block validation runs script checks on several threads at once and a
+shared byte there would be a consensus race rather than a test-tool
+one. Six threads verifying at the same time across both schemes come
+back clean under ThreadSanitizer. The vendored verify code keeps its
+state on the stack, which is what lets the opcode run in a real
+block.
+
+Seeds were unbounded, which the P2MR RPCs in the same fork are not:
+they cap leaf counts and sizes so a request cannot make the node
+allocate at will. An 8 MB seed here was accepted and hashed on every
+draw, all of it while holding the entropy lock. A seed is only
+entropy and no scheme here draws more than 48 bytes of it, so it is
+now bounded at both ends: exactly 48 for SLH-DSA, 32 to 64 for
+ML-DSA, the lower bound so a one-byte seed cannot quietly produce a
+weak key.
+
+The run takes about fourteen seconds, nearly all of it SLH-DSA
+signing at roughly 1.2 s a signature against an ML-DSA one that is
+close to free. That gap is the first hint of what the measurements
+will have to put numbers on, though signing is not the cost consensus
+pays: verification is, and it is the one still unmeasured.
+
 ## Next steps
 
-1. Stage 4: feature_pqsig.py, spending through the PQ leaf in a real
-   block and rejecting a tampered one via submitblock.
-2. Stage 5: calibrate the budget constant from measured verify time;
+1. Stage 5: calibrate the budget constant from measured verify time;
    the comparison table including paper numbers for FN-DSA, SHRINCS
    and SQIsign.
+2. Spend vectors for the opcode, reusing the machinery feature_pqsig.py
+   just built, the same route the P2MR spend vectors took.
