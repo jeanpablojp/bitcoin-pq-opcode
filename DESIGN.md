@@ -158,26 +158,79 @@ deciding here; the prototype allows it and can measure it.
 
 ## 7. Validation weight
 
-Each passing OP_CHECKPQSIG subtracts a constant from the BIP 342
-budget (serialized witness size + 50). The prototype starts with one
-shared placeholder; the bench splits it into per-scheme constants
-when the calibration numbers exist:
+Each passing OP_CHECKPQSIG subtracts a per-scheme constant from the
+BIP 342 budget (serialized witness size + 50), calibrated as
 
-    cost_scheme = 50 * ceil(verify_time_scheme / verify_time_schnorr)
+    weight_scheme = 50 * ceil(median over runs of t_scheme / t_schnorr)
 
-The large witnesses partly self-fund the budget (a 7.9 kB witness
-brings a 7.9k budget), and one thing stage 5 must answer is whether
-the calibrated constants exceed what the witness itself funds; if
-they do, that is exactly the data the costing discussion (Delving
-2702) needs.
+where t is the time one check takes: the public key parse and the
+verification for Schnorr, the leaf commitment hash and the
+verification for a PQ scheme. Each side gets the work its opcode
+repeats per check and nothing else. The sighash is excluded from
+both. That is not neutral, since adding a shared term to both sides
+of a ratio above one pulls it toward one, so excluding it reads the
+ratio high and the constant with it. The bench is
+src/bench/pqc_verify.cpp.
+
+Across sixteen runs on my machine, ML-DSA-44 measures 3.07 times a
+Schnorr check at the median and SLH-DSA-128s 19.24. Verification
+does a fixed amount of work, so the spread between runs (2.94 to
+3.20, and 18.83 to 19.46) is the machine rather than the cost, which
+is why the formula takes a median rather than an extreme. Their
+ceilings are 4 and 20, giving 200 for ML-DSA-44 and 1000 for
+SLH-DSA-128s. The run where each came out worst against the baseline
+ceils the same way, leaving the constants independent of that
+choice.
+
+The margins are uneven and worth knowing: ML-DSA's ratio would have
+to rise 30% to change its constant, SLH-DSA's only 4%, so SLH-DSA is
+the number most likely to move on other hardware.
+
+In seconds rather than units: the worst case the budget bounds is a
+block packed with leaves that repeat one check, which at four
+million witness bytes allows 80,000 Schnorr checks (4.47 s of
+verification at the median), 20,000 ML-DSA checks (3.43 s) or 4,000
+SLH-DSA checks (4.30 s). The three landing close together is the
+formula working, since dividing by a cost proportional to the time
+cancels the time. The direction is what the ceiling buys: both PQ
+schemes come in under the Schnorr worst case the network already
+accepts, where rounding SLH-DSA down to 950 instead would put it at
+4.52 s, over it.
+
+Both vendored trees are the reference implementations, portable C
+with no SIMD, and the baseline is an optimized libsecp256k1.
+Upstream ships AVX2 variants I have not measured, so these ratios
+bound this code rather than the schemes, and a deployment against
+optimized implementations needs its own calibration. These are also
+numbers from one machine, and a BIP-grade calibration wants the same
+bench run on more hardware.
+
+The witnesses fund their own costs with room to spare. An SLH-DSA
+spend carries a 7963-byte witness (budget 8013) and costs 1000; an
+ML-DSA spend carries 3809 bytes (budget 3859) and costs 200. The
+budget only binds when a leaf repeats checks against the same
+signature bytes: eight SLH-DSA checks fit where the ninth fails,
+twenty-three ML-DSA checks fit where the twenty-fourth fails. Both
+boundaries are pinned from both sides in script_tests.cpp and
+through real blocks in feature_pqsig.py.
+
+One boundary pair resolves a per-check cost only to about one part
+in the number of checks the witness affords, which for SLH-DSA is
+eight, so its pair alone accepts anything from 924 to 1034. A second
+pair at a different witness size narrows that, since the two windows
+intersect: padding the witness with one PQ_MAX_ELEMENT_SIZE element
+buys budget without buying checks, affords sixteen, and leaves 989
+through 1034 for the two together.
+
+Sizing the padding deliberately also reaches the one case that
+separates this rule from an off-by-one. BIP 342 fails a spend when
+the budget goes negative rather than when it reaches zero, so a
+spend that ends on exactly zero has to pass; 681 bytes of padding
+funds 9000 units against nine checks costing 9000.
 
 Rejected: costing a PQ verify at the flat 50 units of a Schnorr
-sigop. Consensus only pays for verification, and the stage 0 numbers
-do not isolate it yet (the 1.2 s round trip is dominated by keygen
-and signing), but there is no reason to assume PQ verification lands
-at Schnorr cost, and undercosting validation CPU is the exact failure
-mode the budget exists to prevent. The verify-only measurement is the
-first number the stage 5 bench produces.
+sigop. There was never a reason to assume PQ verification lands at
+Schnorr cost, and it does not; the measured ratios are 3 and 19.
 
 ## Open questions
 
@@ -185,9 +238,10 @@ first number the stage 5 bench produces.
   BIP would size it to whatever scheme set it admits (FN-DSA and
   SHRINCS are smaller; SLH-DSA at higher security levels is much
   larger).
-- The hybrid property from section 6 deserves a measured row of its
-  own: one leaf requiring both a PQ and an EC signature, end to end.
-  I have not seen that number published anywhere.
+- The hybrid property from section 6 is measured: one leaf requiring
+  an EC and an SLH-DSA signature together spends for 8063 witness
+  bytes, 100 more than the PQ-only leaf. What stays open is whether a
+  final BIP wants the hybrid form at all.
 - Whether the scheme byte should encode security level variants
   (ML-DSA-65/87) or each variant gets its own id. Prototype: one id
   per exact parameter set, nothing implicit. Wiring the second scheme
@@ -215,3 +269,12 @@ first number the stage 5 bench produces.
   then accept into the mempool what regtest blocks reject.
 - If the 2702 witness-style design lands, the encoding here migrates
   to that area; sizes in raw bytes carry over unchanged.
+- The constants assume every check pays for a full verification,
+  which is what makes charging per check the right shape at all. The
+  block level aggregation of hash-based signatures raised on Delving
+  2749 would price a signature by proving cost instead, and then it
+  is the budget mechanism that has to change rather than its
+  constant. Nothing follows from that here, since you cannot
+  aggregate a verification nobody has specified yet, but this opcode
+  is the non-aggregated base case and the premise should be on the
+  page.

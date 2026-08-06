@@ -419,10 +419,226 @@ close to free. That gap is the first hint of what the measurements
 will have to put numbers on, though signing is not the cost consensus
 pays: verification is, and it is the one still unmeasured.
 
+## Stage 5, 2026-08-06: measurements
+
+The constant the interpreter charges per passing OP_CHECKPQSIG was a
+placeholder until now. The design note fixed the shape of the answer
+in advance, 50 units times a ratio against Schnorr rounded up to a
+whole multiple, and left this stage to produce the ratio. Settling
+what belongs inside that ratio is most of what follows.
+
+The obvious comparison, the raw primitives of pqc::Verify against
+VerifySchnorr, is not symmetric. VerifySchnorr parses the public key
+before verifying, 5.7 µs of the 56 the call takes, and there is no
+leaving that out because it happens inside the function consensus
+calls. The PQ counterpart is the tagged hash of the public key that
+the leaf commitment check needs, 5.4 µs for ML-DSA's 1312-byte key,
+and a bench of the primitive alone misses it. Pricing one side with
+its per-check overhead and not the other moves ML-DSA's ratio by 3%,
+which would not matter if that ratio were not sitting a couple of
+percent from an integer, with the constant depending on which side of
+it the ratio falls.
+
+The bench therefore measures what each opcode repeats per check:
+public key parse plus verification for Schnorr, commitment hash plus
+verification for the PQ schemes. The public key hash belongs in the
+per-check cost even though the key is already paid for by the
+witness size term, because a leaf repeating the check carries the
+key once and hashes it once per check. That work scales with checks,
+not with witness bytes, which is the case the constant has to cover.
+
+Both benches leave out the sighash, which each path computes once
+per check. That is not the neutral choice it looks like: adding the
+same term to both sides of a ratio above one pulls the ratio toward
+one, so at a sighash of 5 µs the SLH-DSA ratio would read 17.7
+rather than 19.2 and the constant would come out at 900. Excluding
+it reads the ratio high, which is the direction I want. It also
+widens the block level margin below, since a Schnorr check pays for
+a sighash twenty times as often as an SLH-DSA check does.
+
+Sixteen runs on a laptop that also runs an editor and an antivirus,
+with the reference C implementations, reported as median and the
+spread across runs:
+
+| per check              | median   | across runs  | ratio |
+|------------------------|----------|--------------|-------|
+| Schnorr (libsecp256k1) | 55.9 µs  | 54.8-58.0 µs | 1     |
+| ML-DSA-44              | 171 µs   | 169-176 µs   | 3.07  |
+| SLH-DSA-SHA2-128s      | 1074 µs  | 1065-1093 µs | 19.24 |
+
+Sixteen because eleven were not enough: every batch I added widened
+the min and max, which is what extremes of a sample do as long as
+the noise keeps going. Within a run nanobench reports 0.2% to 1.2%
+error; the spread between runs is the machine. Verification here
+does a fixed amount of work, so that spread is measurement noise
+rather than variation in what a check costs, and the median is the
+estimate. The range is there to show the noise, not to bound the
+cost; it would keep widening if I kept running.
+
+The medians give ratios of 3.07 and 19.24, whose ceilings are 4 and
+20, so 200 for ML-DSA-44 and 1000 for SLH-DSA-SHA2-128s. The run
+where each came out worst against the baseline gives 3.20 and 19.46,
+which ceil the same way. The constants therefore do not depend on
+picking a central estimate over a pessimistic one, and that agreement
+is worth more than either number on its own. The placeholder was 1000
+for both, which happens to be the SLH-DSA answer.
+
+Neither ratio has much room, though, and they have different amounts
+of it. ML-DSA's median would have to climb 30% before the constant
+moved to 250, while SLH-DSA's needs only 4% to reach 20.0 and push
+its constant to 1050. So the SLH-DSA number is the one that a bench
+run on faster or slower hardware is most likely to unseat, and the
+one a real calibration should measure most carefully.
+
+For the record, a series taken right after a compile, with the load
+average at 27, gave ratios of 2.75-3.19 and 17.65-19.42. Those are
+not in the sixteen; they measure the machine, not the code.
+
+Units are hard to argue about. In seconds: the worst case the budget
+bounds is a block packed with leaves that repeat one check, and a
+block holds at most four million witness bytes, which puts the check
+count at four million over the per-check cost.
+
+At the medians above:
+
+| scheme            | max checks | verification | vs Schnorr |
+|-------------------|------------|--------------|------------|
+| Schnorr           | 80,000     | 4.47 s       | 1.00       |
+| ML-DSA-44         | 20,000     | 3.43 s       | 0.77       |
+| SLH-DSA-SHA2-128s | 4,000      | 4.30 s       | 0.96       |
+
+That the three land close together is the formula working rather
+than an independent result, since dividing by a cost proportional to
+the time cancels the time. What is not automatic is the direction:
+both PQ schemes come in under the Schnorr worst case the network
+already accepts, and they do so because the ceiling rounded both
+costs up. Rounding down instead, which the fastest SLH-DSA run would
+have permitted at 950, allows 4210 checks and puts it at 4.52 s,
+over the line. Taking the ceiling is what keeps it under.
+
+Some caveats belong next to those numbers. Both vendored trees are
+the reference implementations, portable C with no SIMD anywhere in
+them, and Dilithium's symbols say so outright:
+pqcrystals_dilithium2_ref_*. The baseline they are measured against
+is an optimized libsecp256k1. Upstream ships AVX2 variants of both
+schemes that I have not built or measured, so the honest statement
+is that these ratios bound this code rather than the schemes, and a
+deployment against optimized implementations needs its own
+calibration. And this is one machine. A BIP-grade calibration wants
+the same bench run on more hardware than mine.
+
+Splitting the shared constant in two touched script.h and one line
+of the interpreter, where the subtraction goes through a switch on
+the scheme with no default case, so adding a third scheme without
+pricing it is a compiler warning rather than a silent inheritance of
+SLH-DSA's cost. PubKeySize and SigSize are written the same way.
+
+A leaf that repeats the check (OP_2DUP <commitment> OP_CHECKPQSIG
+OP_VERIFY per repetition) adds 37 bytes of leaf script per check,
+which buys 37 more units of budget against a check costing 200 or
+1000, so repetition runs the budget out. I worked the boundaries out
+on paper first: one SLH-DSA witness funds eight checks and fails on
+the ninth, one ML-DSA witness funds twenty-three and fails on the
+twenty-fourth. Both pairs then passed unchanged in script_tests.cpp
+and through real blocks in feature_pqsig.py. The numbers in the
+tests are predictions that held, not values copied from a first run.
+
+A boundary pair pins a constant less tightly than it looks. Working
+the inequalities backwards, the ML-DSA pair passes for any cost in
+(196.5, 203.4], a fine 2%, but the SLH-DSA pair passes for anything
+in (923.9, 1034.8]. Setting the constant to 950 and running the
+suite confirms it: everything still passes. The resolution of a
+boundary pair is about one part in n, where n is the number of
+checks the witness affords, and n is eight for SLH-DSA precisely
+because its checks are expensive.
+
+The fix is a second boundary at a different witness size, since two
+windows intersect to something narrower than either. Padding the
+witness with one more element buys budget without buying checks, and
+the largest element the leaf admits is already named:
+PQ_MAX_ELEMENT_SIZE. With 8192 bytes of padding the same witness
+affords sixteen checks rather than eight, giving (988.6, 1048.1],
+and the two pairs together leave (988.6, 1034.8]. That is a 4.6%
+window, and more to the point it excludes 950, which the padded pair
+rejects.
+
+Being able to size the padding to order turned out to be worth more
+than the narrower window. BIP 342 fails a spend when the budget goes
+negative, not when it hits zero, and no boundary case here lands on
+zero: the tightest leaves 79 units. Choosing the padding so the
+budget comes out exact reaches it. At 681 bytes the witness funds
+9000 against nine checks costing 9000, so the spend has to pass with
+nothing left, and changing the interpreter's test from negative to
+non-positive breaks it. That off-by-one is invisible everywhere
+except at zero, which is why it takes a case that lands there.
+
+One reason the budget matters more here than it does for Schnorr:
+the repeated-check leaf verifies the same signature over the same
+sighash every time, and in block validation, where the signature
+cache is storing, every repetition after the first is a cache hit on
+the Schnorr side. CachingTransactionSignatureChecker overrides
+VerifySchnorrSignature and not VerifyPQSignature, which nothing
+wires up yet, so a PQ repetition pays in full. BIP 342 charges 50 a
+check either way, but on the PQ side the budget is currently the
+only thing bounding that case.
+
+The size table, every row spent through a real block and the witness
+sizes asserted byte for byte in feature_pqsig.py:
+
+| spend                           | witness | weight | vsize | cost |
+|---------------------------------|---------|--------|-------|------|
+| P2TR key path                   | 66 B    | 444    | 111   | n/a  |
+| P2TR script path, checksig leaf | 167 B   | 545    | 137   | 50   |
+| P2MR, same checksig leaf        | 135 B   | 513    | 129   | 50   |
+| P2MR, ML-DSA-44 leaf            | 3809 B  | 4187   | 1047  | 200  |
+| P2MR, SLH-DSA-128s leaf         | 7963 B  | 8341   | 2086  | 1000 |
+| P2MR, hybrid EC+SLH-DSA leaf    | 8063 B  | 8441   | 2111  | 1050 |
+
+Weight and vsize are for the whole one-input, one-output test
+transaction; the witness column is the per-input cost and is exact.
+The cost column is the validation weight the leaf spends, which is a
+tapscript rule: a key path spend runs no script and has no budget,
+hence the n/a rather than a 50. The hybrid leaf pays for both of its
+checks, 1000 and 50.
+
+The 32-byte P2MR discount against the taproot script path is still
+there in the PQ rows, but next to signatures in the thousands of
+bytes it barely registers.
+
+The hybrid row is a number I had not seen published anywhere: one
+leaf requiring an EC and an SLH-DSA signature together spends for
+8063 witness bytes, 100 more than the PQ-only leaf (65 for the
+Schnorr signature with its prefix, 35 for the extra leaf bytes). A
+hybrid spend costs 1.3% more than the PQ spend it wraps.
+
+The self-funding question from the design note has its answer: both
+schemes fund their own verification with room to spare. The SLH-DSA
+witness brings a budget of 8013 against a cost of 1000, the ML-DSA
+witness 3859 against 200. For single-signature leaves the calibrated
+costs change nothing about what is spendable; they bind when a
+script repeats checks against the same signature bytes, which is the
+adversarial case they exist for.
+
+For the schemes I am not implementing, paper numbers, with a witness
+estimate computed from the same witness shape (signature, pubkey,
+35-byte leaf, 33-byte control block, plus prefixes):
+
+| scheme     | sig        | pubkey | est. witness      | status     |
+|------------|------------|--------|-------------------|------------|
+| FN-DSA-512 | ~666 B     | ~897 B | ~1.6 kB           | FIPS 206 draft |
+| SHRINCS    | ~2.5 kB    | n/a    | ~2.6 kB + pubkey  | eprint 2025/2203 |
+| SQIsign    | ~0.2 kB    | ~64 B  | ~0.4 kB           | NIST additional round |
+
+Estimates, not measurements; nothing was built for these. The two
+measured rows show why size alone does not rank the table: ML-DSA
+and SLH-DSA differ by a factor of six in verify time, and the budget
+constant has to be calibrated per scheme either way. SQIsign trades
+its small signatures for verification cost, so its row would need
+its own measurement before the size means much.
+
 ## Next steps
 
-1. Stage 5: calibrate the budget constant from measured verify time;
-   the comparison table including paper numbers for FN-DSA, SHRINCS
-   and SQIsign.
-2. Spend vectors for the opcode, reusing the machinery feature_pqsig.py
-   just built, the same route the P2MR spend vectors took.
+1. Spend vectors for the opcode, reusing the machinery
+   feature_pqsig.py built, the same route the P2MR spend vectors
+   took.
+2. The write-up, once the vectors exist.
