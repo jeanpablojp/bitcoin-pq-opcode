@@ -788,6 +788,89 @@ field.
 Regenerating twice gives byte-identical output, since the RPC
 reinstalls the seed before signing.
 
+## Stage 5d, 2026-08-07: conformance, and what it found
+
+Everything so far rests on the two vendored trees computing what
+their standards say. Cross-validating against a separately built
+libbitcoinpqc proves less than it appears to: this tree was copied
+from libbitcoinpqc, so both descend from the same upstream, and the
+test catches a vendoring or wiring mistake rather than a deviation
+from the standard. Real conformance needs vectors nobody in that
+chain produced.
+
+Those exist. PQClean pins a nistkat-sha256 for both ml-dsa-44 and
+sphincs-sha2-128s-simple, and NIST publishes ACVP vectors for
+SLH-DSA. Building PQClean's KAT generator, checking it reproduces
+the hashes PQClean publishes, and then running the same procedure
+over this tree with the NIST CTR-DRBG in place of the entropy hook
+gives an answer that does not depend on my own code being right.
+
+ML-DSA-44 reproduces the KAT. It is FIPS 204, the name matches the
+implementation, and nothing below this line applies to it.
+
+### The SLH-DSA in this tree is not SLH-DSA
+
+It is SPHINCS+, the code that accompanied the submission to the NIST
+competition. FIPS 205 changed the inputs to signing and verification
+to add domain separation: the message that gets signed is prefixed
+with a separator byte, a context length and the context. This tree's
+crypto_sign_signature takes no context at all.
+
+The ACVP vectors settle it rather than argue it. NIST publishes 14
+verification cases for SHA2-128s on the external interface without
+prehashing, 2 of them valid signatures and 12 tampered in a stated
+way. This tree agrees with NIST on 12, and the 12 are exactly the
+ones where a signature is meant to be refused. It accepts neither
+valid signature. A verifier that rejected everything would score the
+same 12.
+
+The same 14 cases, run through two implementations that do follow
+FIPS 205, come back 14 out of 14, which is what says the harness is
+sound and the failure belongs to the code under test.
+
+None of this makes the tree broken. It reproduces PQClean's KAT byte
+for byte, so it is faithful SPHINCS+, correctly vendored, with the
+right parameter set. Sizes, measurements and everything built on top
+stand. What is wrong is the name, and the name is the part a
+companion BIP would have to get exactly right: anyone implementing
+from a BIP that says FIPS 205 would produce signatures this opcode
+rejects.
+
+The label came in with the code. libbitcoinpqc's header declares
+"FIPS 205 - SLH-DSA-SHA2-128s Level 1" over the SPHINCS+ submission
+sources, and this tree copied the claim along with the files. Worth
+telling cryptoquick.
+
+### What replaces it
+
+Two implementations pass the official vectors. The reference tree's
+own FIPS 205 update lives in a pull request opened on 13 May and not
+touched since the day it was opened.
+slhdsa-c, from the PQ Code Package project, is written against the
+standard rather than adapted to it. Across all twelve FIPS 205
+parameter sets it agrees with NIST on all 168 verification cases,
+accepting all 24 valid signatures among them, and reproduces all 168
+signing cases byte for byte.
+
+Two things that look like advantages are not. Its CBMC proofs cover
+four helpers, address setting and hash initialisation, and say
+nothing about signing or verification. And comparing the two across
+the wider parameter sets needs a harness whose buffers fit the
+largest signature, 29792 bytes at SHA2-256s: size them for 128s and
+the alternative appears to fail cases it actually passes. Both pass
+everything. The choice between them is maintenance and packaging,
+not correctness.
+
+One consequence is worth having on its own. slhdsa-c draws no
+randomness of its own: key generation takes a generator as an
+argument and signing takes the extra randomness explicitly, with
+NULL selecting the deterministic variant FIPS 205 defines. The
+global entropy state this tree carries, the lock around it and the
+data race stage 4 found in it all exist to serve a library that
+insists on calling randombytes() for itself.
+
 ## Next steps
 
-1. The write-up.
+1. Move the SLH-DSA backend to slhdsa-c, which regenerates the spend
+   vectors and recalibrates the weight constant.
+2. The write-up.
