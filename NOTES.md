@@ -869,8 +869,124 @@ global entropy state this tree carries, the lock around it and the
 data race stage 4 found in it all exist to serve a library that
 insists on calling randombytes() for itself.
 
-## Next steps
+## Stage 5e, 2026-08-07: the backend moves to slhdsa-c
 
-1. Move the SLH-DSA backend to slhdsa-c, which regenerates the spend
-   vectors and recalibrates the weight constant.
+The vendored SPHINCS+ tree is out and slhdsa-c is in, which makes the
+SLH-DSA name in the code true. Only the SHA2 half is vendored: four
+sources and eight headers, against the eleven sources the old tree
+needed. The SHAKE and SHA-3 files stay out because they only serve
+parameter sets this build does not offer. Six SHA2 sets come along
+whether I want them or not, since they are all defined in one file,
+and the opcode names the one it wants at each call: upstream selects
+the parameter set through a pointer at runtime rather than by macro,
+which is a better fit here than the old tree's compile-time PARAMS.
+
+The seed keeps working unchanged. Both implementations take 48 bytes
+and split them into SK.seed, SK.prf and PK.seed, so the same seed
+gives the same key pair, and regenerating the spend vectors changed
+only the signatures: 5 of the 7 valid spends and 7 of the 11
+negatives, which is exactly the set carrying an SLH-DSA signature.
+Every public key, leaf script, Merkle root and sighash in the file
+came back identical. That is the check I would have wanted anyway,
+since it separates what FIPS 205 changed (the message that gets
+signed) from what it did not.
+
+What the opcode signs is now worth stating precisely, because a BIP
+has to: the FIPS 205 pure variant with an empty context, so the
+scheme receives a zero separator byte, a zero context length and
+then the 32-byte tapscript sighash. A one-byte context is a
+different message and the test suite pins that, which is what keeps
+the wrapper from drifting onto some other variant later.
+
+The entropy hook is gone from this half. slhdsa-c takes its key
+seeds as arguments and signs deterministically when handed no extra
+randomness, so key generation and signing both run without
+installing anything. randombytes() is now Dilithium's alone, and the
+lock around it and the data race stage 4 found in it exist for one
+scheme rather than two. The test that asserted signing fails with no
+entropy installed asserts the opposite for SLH-DSA now, and that it
+reproduces the same signature twice.
+
+### Conformance in the suite
+
+Conformance moves in-tree, and the PQClean known-answer test that
+stage 5d leaned on goes away with the code it applied to. NIST's
+ACVP cases for SLH-DSA-SHA2-128s ship as test data instead: 10 key
+generation cases, and 14 verification and 14 signing ones on the
+external interface without prehashing. I had extracted those from a
+copy of NIST's files shipped in another repository, so I downloaded
+the originals from usnistgov/ACVP-Server and compared. Byte for byte
+the same.
+
+Verification and signing reach the vendored library directly rather
+than going through the consensus wrapper, because those cases use
+arbitrary messages and contexts while the wrapper fixes both. Two
+tests cover the seam. One signs through the wrapper, then verifies
+the result against FIPS 205 with an empty context and watches it
+fail with a one-byte one. The other runs key generation through the
+wrapper: NIST hands the three key seeds separately and the wrapper
+takes 48 bytes, so a passing case fixes the order and the offsets it
+splits at. That one exists because nothing else covered the split.
+The spend vectors carry published keys rather than deriving them,
+and both the script tests and the wrapper's own round trip stay
+self-consistent under any split. Mis-splitting the seed passed
+everything I had until this test.
+
+Removing the domain prefix from the vendored hash function, which is
+what the old tree was missing, makes the suite fail in exactly the
+shape stage 5d reported: zero of the 2 valid signatures accepted,
+every signing case mismatched. I ran the old tree against the same
+cases too and it scores the same 12 of 14. The mutation and the real
+thing agree, so the test measures what it claims to.
+
+It costs 13 seconds, most of it the 14 signatures. That is the
+slowest thing in the unit suite by some way, and I am keeping it:
+the whole point of the parameter set is that signing is slow.
+
+Two smaller things came out of going back over the migration. The
+entropy state is wiped through memory_cleanse when the lock goes
+out of scope, and with SLH-DSA no longer installing anything, the
+common path now hands memset a null pointer and a zero length,
+which is undefined by the letter of the standard even where it does
+no harm. It returns early on an empty state instead. And the
+pqsignhash help still told callers that both schemes randomize
+their signatures, which is a claim a user can act on and is now
+wrong for one of them.
+
+### The weight constant drops to 750
+
+slhdsa-c verifies faster, so the calibration moves. Five runs, taking
+the median of each: 55.3 µs a Schnorr check, 165.1 µs an ML-DSA
+check, 794.2 µs an SLH-DSA check against 1074 µs before. The ratio
+falls from 19.24 to 14.36 and the constant from 1000 to 750.
+
+The ML-DSA ratio moved too, from 3.07 to 2.99, and nothing about
+ML-DSA changed. That is the measurement, not the code, and it
+matters because 3 is where the ceiling flips: the five runs span
+2.984 to 3.029, straddling it, so median and maximum give 150 and
+200. I took the maximum for both schemes and left ML-DSA at 200. A
+constant that exists to stop underpriced validation should round the
+way that charges more when the reading is this close, and I would
+rather state the rule as the worst run than pretend the median is
+stable to three digits.
+
+Both margins are now thin. ML-DSA is 1% above dropping to 150,
+SLH-DSA has 4% above and 3% below. Neither number is settled until
+this bench runs on hardware that is not mine.
+
+The budget boundaries move with the constant. One SLH-DSA witness
+funds eleven checks and fails on the twelfth, and the padded witness
+funds twenty-two where it funded sixteen. The pair of pins narrows
+the admissible cost to 741 through 762, where it was 989 to 1034.
+Those come from the budgets the interpreter computes, printed from
+inside the test, rather than from deriving the witness serialization
+by hand: it has enough small terms that being off by tens is easy,
+and every boundary here is an exact integer comparison. The
+exact-zero case moves too: twelve checks against 570 bytes of
+padding spend the budget to precisely 9000.
+
+### Next steps
+
+1. Stage 5c, measuring FN-DSA, SQIsign and SHRINCS on this machine,
+   so the comparison table stops mixing my numbers with paper ones.
 2. The write-up.

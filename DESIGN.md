@@ -5,6 +5,14 @@ lists the alternative I rejected and why. Nothing here is final spec;
 it is the shape I am building and measuring. Both schemes are
 implemented and tested.
 
+The two schemes named below are the standardised ones. SLH-DSA comes
+from slhdsa-c and ML-DSA from the Dilithium reference code, and the
+SLH-DSA half is checked against NIST's own ACVP vectors inside the
+test suite, which is what lets the name be used without qualifying
+it. What the opcode signs is the FIPS 205 pure variant with an empty
+context, so the message reaching the scheme is the domain separator,
+a zero context length and then the 32-byte tapscript sighash.
+
 ## 1. Delivery: redefine an OP_SUCCESSx inside tapscript
 
 The opcode is a redefinition of OP_SUCCESS187 (0xbb) under leaf
@@ -172,44 +180,48 @@ of a ratio above one pulls it toward one, so excluding it reads the
 ratio high and the constant with it. The bench is
 src/bench/pqc_verify.cpp.
 
-Across sixteen runs on my machine, ML-DSA-44 measures 3.07 times a
-Schnorr check at the median and SLH-DSA-128s 19.24. Verification
-does a fixed amount of work, so the spread between runs (2.94 to
-3.20, and 18.83 to 19.46) is the machine rather than the cost, which
-is why the formula takes a median rather than an extreme. Their
-ceilings are 4 and 20, giving 200 for ML-DSA-44 and 1000 for
-SLH-DSA-128s. The run where each came out worst against the baseline
-ceils the same way, leaving the constants independent of that
-choice.
+Across five runs on my machine, ML-DSA-44 measures 2.99 times a
+Schnorr check at the median and SLH-DSA-128s 14.36. The ratio I
+apply is the highest of the runs rather than the median, 3.03 and
+14.43, and the reason is ML-DSA: its ratio sits so close to 3 that
+the runs fall on both sides of it, and median and maximum ceil to
+different constants. When a ratio lands on an integer that way, the
+safe reading is the one that charges more. The ceilings are 4 and
+15, giving 200 for ML-DSA-44 and 750 for SLH-DSA-128s.
 
-The margins are uneven and worth knowing: ML-DSA's ratio would have
-to rise 30% to change its constant, SLH-DSA's only 4%, so SLH-DSA is
-the number most likely to move on other hardware.
+Neither margin is comfortable. ML-DSA would have to rise 32% to
+reach the next constant up but only fall 1% to drop to 150, and
+SLH-DSA has 4% above and 3% below. Both numbers can move on other
+hardware, which is the argument for running this bench somewhere
+else before any of it is treated as settled.
 
 In seconds rather than units: the worst case the budget bounds is a
 block packed with leaves that repeat one check, which at four
-million witness bytes allows 80,000 Schnorr checks (4.47 s of
-verification at the median), 20,000 ML-DSA checks (3.43 s) or 4,000
-SLH-DSA checks (4.30 s). The three landing close together is the
+million witness bytes allows 80,000 Schnorr checks (4.42 s of
+verification at the median), 20,000 ML-DSA checks (3.30 s) or 5,333
+SLH-DSA checks (4.24 s). The three landing close together is the
 formula working, since dividing by a cost proportional to the time
 cancels the time. The direction is what the ceiling buys: both PQ
 schemes come in under the Schnorr worst case the network already
-accepts, where rounding SLH-DSA down to 950 instead would put it at
-4.52 s, over it.
+accepts, where rounding SLH-DSA down to 700 instead would put it at
+4.54 s, over it.
 
-Both vendored trees are the reference implementations, portable C
-with no SIMD, and the baseline is an optimized libsecp256k1.
-Upstream ships AVX2 variants I have not measured, so these ratios
-bound this code rather than the schemes, and a deployment against
-optimized implementations needs its own calibration. These are also
-numbers from one machine, and a BIP-grade calibration wants the same
-bench run on more hardware.
+Both vendored trees are portable C with no SIMD, against a baseline
+of an optimized libsecp256k1. The ML-DSA one is the reference
+implementation, whose upstream ships an AVX2 variant I have not
+measured; the SLH-DSA one is a portable C90 implementation that
+offers no optimized variant at all, though faster SLH-DSA code
+exists elsewhere. Either way these ratios bound this code rather
+than the schemes, and a deployment against optimized
+implementations needs its own calibration. These are also numbers
+from one machine, and a BIP-grade calibration wants the same bench
+run on more hardware.
 
 The witnesses fund their own costs with room to spare. An SLH-DSA
-spend carries a 7963-byte witness (budget 8013) and costs 1000; an
+spend carries a 7963-byte witness (budget 8013) and costs 750; an
 ML-DSA spend carries 3809 bytes (budget 3859) and costs 200. The
 budget only binds when a leaf repeats checks against the same
-signature bytes: eight SLH-DSA checks fit where the ninth fails,
+signature bytes: eleven SLH-DSA checks fit where the twelfth fails,
 twenty-three ML-DSA checks fit where the twenty-fourth fails. Both
 boundaries are pinned from both sides in script_tests.cpp and
 through real blocks in feature_pqsig.py.
