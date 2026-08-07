@@ -636,9 +636,158 @@ constant has to be calibrated per scheme either way. SQIsign trades
 its small signatures for verification cost, so its row would need
 its own measurement before the size means much.
 
+## Stage 5b, 2026-08-07: spend vectors
+
+The P2MR spend vectors came out of a standalone generator that needed
+no node, because Python can sign BIP 340. Python cannot produce a PQ
+signature, so this generator is a test framework script that starts a
+regtest node and uses it as a signing oracle and nothing else. The
+transactions are built and their sighashes computed on the Python
+side, the way feature_pqsig.py does it, which leaves the node blind
+to the transaction it signs for.
+
+What the vectors can promise took some deciding. A BIP 340 vector
+hands you a private key and you re-derive the signature, because BIP
+340 signing is specified down to the last byte. Neither PQ scheme
+here is: both randomize part of the signature and draw that
+randomness from randombytes(), so the only code that reproduces one
+of these signatures from a seed is code that installs the same
+entropy hook this tree does. Publishing a seed and calling the
+signature derivable from it would be a promise no conforming FIPS 204
+or 205 implementation could keep.
+
+So these are verification vectors. The signature is given data, the
+way most BIP 340 vectors give one, and everything an implementer
+derives for themselves sits next to it: leaf hash, Merkle root,
+control block, the scheme byte and tagged public key hash the leaf
+commits to, the signature message and the sighash. What a third party
+checks is that they compute the same sighash and reach the same
+verdict, which is the part that belongs to this opcode rather than to
+the signature scheme.
+
+One asymmetry worth writing down, since it argues the other way for
+half the file: SLH-DSA key generation from a seed is FIPS 205
+keygen, so an independent implementation could re-derive that public
+key from a 48-byte seed. ML-DSA has no seeded entry point in the
+vendored code, and its key comes from the same hook the signature
+does. Publishing seeds would have meant a field that is checkable for
+one scheme and decorative for the other.
+
+Seven valid spends in one transaction: an SLH-DSA leaf under
+SIGHASH_DEFAULT, an ML-DSA leaf under SIGHASH_ALL (whose signature
+carries the explicit trailing hash type byte, 2421 rather than 2420),
+the hybrid leaf requiring an SLH-DSA and a BIP 340 signature over one
+sighash, an SLH-DSA spend with an annex, a leaf requiring both
+schemes with a key each, and two rows that exist because nothing else
+in the file reaches the rules they carry.
+
+The first is SIGHASH_SINGLE with ANYONECANPAY. DEFAULT and ALL take
+the same branch of the BIP 341 message; ANYONECANPAY replaces the
+five aggregate hashes with this input's own outpoint, amount, script
+and sequence, and SINGLE adds the hash of the one output. The message
+comes out 163 bytes rather than 212, which is the size difference
+between the two branches. An implementation handling only the ALL
+family would satisfy every other row here.
+
+The second is a leaf whose OP_CHECKPQSIG sits inside a branch that
+never executes. It checks no signature and needs none, and it still
+carries an initial stack element of the full 8192 bytes, because the
+larger bound follows the presence of the opcode in the script rather
+than its execution: the OP_SUCCESSx scan reads the whole leaf before
+any branch is evaluated. Its counterpart among the negatives is an
+element of 521 bytes in a leaf with no OP_CHECKPQSIG at all, which is
+refused. Between them they say the relaxed bound is scoped to leaves
+that name the opcode and does not leak to the rest of the tree.
+
+Eleven negatives cover every rule the design note states, several of
+them from more than one side: tampered signature, public key outside
+the commitment, wrong public key size, signature one byte short, a
+32-byte commitment, explicit 0x00 hash type, an element one byte past
+PQ_MAX_ELEMENT_SIZE, an oversized element in a leaf without the
+opcode, an unknown scheme byte, and two empty-signature cases.
+
+The second of those pins the rule the design note argues hardest for.
+An empty signature ends evaluation false rather than failing the
+script, and on that path the public key is deliberately not looked
+at, because a branch across two schemes leaves the other scheme's key
+on the stack and rejecting it on size would break the IF/ELSE
+construction the rule exists to keep cheap. The vector is an empty
+signature with a 1312-byte ML-DSA key against an SLH-DSA leaf, which
+has to end false rather than fail on size. Moving the size check
+above the empty-signature path in the interpreter breaks it, which is
+what makes it a vector rather than a restatement.
+
+The C++ side re-derives the tree from the published scriptTree and
+runs every witness through VerifyScript, so it exercises consensus
+rather than a second implementation of it. It also recomputes the
+published sighash, which matters most on the row carrying an annex:
+the annex is dropped from the stack before execution and comes back
+only as a hash inside the message, which is an easy place for two
+implementations to stop agreeing without either one failing.
+
+A harness that reads a JSON file can pass by doing nothing, which is
+worth ruling out directly. Corrupting a signature, a Merkle root, a
+sighash, the sighash of the annex row, a signature message, a public
+key commitment, an x-only key, the declared padding size and an
+expected error string each makes it fail.
+
+Two of those mutations are the ones worth having, because a
+published key checked only against its own commitment proves
+nothing: replace the two together and they still agree, and the
+witness verifies either way, since a mutation to the published
+fields never touches it. The keys a leaf names, both the PQ
+commitments and the x-only one, therefore have to be found in the
+leaf script that pushes them.
+
+The file says which flag to verify under, which it has to. Without
+SCRIPT_VERIFY_PQSIG the leading byte is still OP_SUCCESS187, and the
+scan that handles it runs before every other rule, element size
+limits included. Dropping the flag in the harness confirms what that
+means: all eleven invalid cases come back accepted, with no error at
+all. A reader running the vectors that way would conclude the file
+was wrong.
+
+There is nothing upstream to check the sighash against, which is
+worth stating plainly: the BIP 341 vector file in this repository
+carries scriptPubKey and key path spending, and no script path
+vector at all. The message assembly these vectors pin has no
+published reference. What it does have is two implementations
+agreeing, since the generator computes the sighash in Python from
+the test framework's own reading of BIP 341 and the harness
+recomputes it in C++ from the consensus code.
+
+The leaves are also checkable against the other side of this project.
+feature_pqsig.py builds its leaves from the same seeds, so the leaf
+script for a given scheme has to come out identical there and in the
+vectors, and it does for every single-scheme row.
+
+Checking the vectors against the tree that produced them proves
+consistency and not much else, so the published signatures also go
+through the libbitcoinpqc build I keep separately, the one stage 3
+used to get past self-consistency. All seven are accepted, including
+the ML-DSA signature carrying an explicit hash type byte, whose base
+2420 bytes verify once that transport byte comes off. That last one
+is worth having: it says the trailing byte is a transport convention
+this opcode defines and not something the scheme ever sees.
+
+The vectors are compiled into the test binary rather than read at
+run time, which is worth knowing before running that kind of check:
+restoring a corrupted file is not enough on its own, and a rebuild
+has to come between the restore and the next run. A binary carrying
+a mutation whose file has been put back reports a failure that looks
+like a real one.
+
+The failure mode a vector file invites is a field it publishes and
+nothing verifies, which drifts from the data around it and misleads
+whoever trusts it. The sighash, the x-only key and the size of the
+padded element are each easy to publish and leave unread. The check
+is mechanical, list the keys the file publishes and look for each in
+the harness, and it is cheap enough to run whenever the file gains a
+field.
+
+Regenerating twice gives byte-identical output, since the RPC
+reinstalls the seed before signing.
+
 ## Next steps
 
-1. Spend vectors for the opcode, reusing the machinery
-   feature_pqsig.py built, the same route the P2MR spend vectors
-   took.
-2. The write-up, once the vectors exist.
+1. The write-up.
